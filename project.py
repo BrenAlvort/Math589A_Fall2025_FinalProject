@@ -2,40 +2,35 @@ import numpy as np
 
 def svd_features(image, p, tol=1e-12):
     """
-    Compute an SVD-based feature vector for a grayscale image.
+    Build an SVD-based feature vector for a grayscale image.
 
-    Returns:
+    Output format (length p+2):
       [ s1_hat, ..., sp_hat, r95, r99 ]
+
     where:
-      - s_i_hat are normalized leading singular values
-      - r95 is the smallest rank capturing >= 95% Frobenius energy
-      - r99 is the smallest rank capturing >= 99% Frobenius energy
+      - s_i_hat are scale-invariant leading singular values (normalized by s1),
+      - r95/r99 are the smallest ranks capturing 95%/99% of Frobenius energy.
     """
     A = np.asarray(image, dtype=np.float64)
 
-    # Singular values only; compute_uv=False is efficient.
-    # full_matrices is irrelevant when compute_uv=False, but keep it False for clarity.
+    # Only singular values are needed.
     S = np.linalg.svd(A, full_matrices=False, compute_uv=False)
 
-    # Energy = sum sigma_i^2 = ||A||_F^2 (matches the "energy" view in the notes).
+    # Effective ranks based on Frobenius energy: ||A||_F^2 = sum_i sigma_i^2
     energy = S * S
     total_energy = float(energy.sum())
-
     if total_energy <= tol:
-        # Degenerate image: return raw leading singular values (zeros likely) and ranks 0
         top = S[:p].astype(np.float32, copy=False)
         return np.concatenate([top, np.array([0.0, 0.0], dtype=np.float32)])
 
     cum_energy = np.cumsum(energy) / total_energy
-
-    # Effective ranks at 95% and 99% energy (1-based indexing)
     r95 = float(np.searchsorted(cum_energy, 0.95) + 1)
     r99 = float(np.searchsorted(cum_energy, 0.99) + 1)
 
-    # Normalize singular values in an energy-consistent way:
-    # sigma_i / ||A||_F  (dimensionless, stable scaling)
-    frob = np.sqrt(total_energy)
-    top = (S[:p] / frob).astype(np.float32, copy=False)
+    # Scale-invariant singular-value profile (helps when overall brightness/contrast changes)
+    s1 = float(S[0])
+    scale = s1 if s1 > tol else np.sqrt(total_energy)
+    top = (S[:p] / scale).astype(np.float32, copy=False)
 
     return np.concatenate([top, np.array([r95, r99], dtype=np.float32)])
 
@@ -46,7 +41,7 @@ def lda_train(X, y):
 
     Returns:
       w, tau
-    where classifier is: 1 if (w^T x) >= tau else 0.
+    with prediction rule: class 1 if (w^T x) >= tau else class 0.
     """
     X = np.asarray(X, dtype=np.float64)
     y = np.asarray(y)
@@ -64,34 +59,28 @@ def lda_train(X, y):
     mu0 = X0.mean(axis=0)
     mu1 = X1.mean(axis=0)
 
-    # Within-class scatter: Sw = sum_{x in class0} (x-mu0)(x-mu0)^T + same for class1
+    # Within-class scatter matrix (pooled, unnormalized covariance numerator)
     X0c = X0 - mu0
     X1c = X1 - mu1
     Sw = (X0c.T @ X0c) + (X1c.T @ X1c)
 
-    # Regularization (ridge) to stabilize if Sw is singular/ill-conditioned:
-    # Sw_reg = Sw + lam * I  (matches the recommended approach in the project notes)
+    # Diagonal loading for numerical stability (avoids explicit inverse)
     d = Sw.shape[0]
     tr = float(np.trace(Sw))
     lam = (1e-6 * tr / d) if tr > 0.0 else 1e-6
     Sw_reg = Sw + lam * np.eye(d, dtype=np.float64)
 
-    # Two-class LDA direction: w ∝ Sw^{-1}(mu1 - mu0), computed via solve (no explicit inverse).
+    # LDA direction: w ∝ Sw^{-1}(mu1 - mu0)
     w = np.linalg.solve(Sw_reg, (mu1 - mu0))
 
-    # Natural threshold: midpoint of projected class means
-    m0 = float(w @ mu0)
-    m1 = float(w @ mu1)
-    tau = 0.5 * (m0 + m1)
+    # Midpoint threshold in projected space
+    tau = 0.5 * (float(w @ mu0) + float(w @ mu1))
 
     return w, tau
 
 
 def lda_predict(X, w, threshold):
-    X = np.asarray(X, dtype=np.float64)
-    w = np.asarray(w, dtype=np.float64)
-    scores = X @ w
-    return (scores >= threshold).astype(int)
+    return (X @ w >= threshold).astype(int)
 
 
 def _example_run():
@@ -116,22 +105,36 @@ def _example_run():
     p = min(32, min(X_train.shape[1], X_train.shape[2]))
     print(f"Using p = {p} leading singular values for features.")
 
+    # Build feature matrices
     def build_features(X):
-        feats = [svd_features(img, p) for img in X]
+        feats = []
+        for img in X:
+            feats.append(svd_features(img, p))
         return np.vstack(feats)
 
-    Xf_train = build_features(X_train)
-    Xf_test = build_features(X_test)
+    try:
+        Xf_train = build_features(X_train)
+        Xf_test = build_features(X_test)
+    except NotImplementedError:
+        print("Implement 'svd_features' first to run this example.")
+        return
 
-    print("Feature dimension:", Xf_train.shape[1])
+    try:
+        w, threshold = lda_train(Xf_train, y_train)
+    except NotImplementedError:
+        print("Implement 'lda_train' first to run this example.")
+        return
 
-    w, threshold = lda_train(Xf_train, y_train)
-    y_pred = lda_predict(Xf_test, w, threshold)
+    try:
+        y_pred = lda_predict(Xf_test, w, threshold)
+    except NotImplementedError:
+        print("Implement 'lda_predict' first to run this example.")
+        return
 
     accuracy = np.mean(y_pred == y_test)
     print(f"Example test accuracy: {accuracy:.3f}")
 
 
 if __name__ == "__main__":
+    # This allows students to run a quick local smoke test.
     _example_run()
-
