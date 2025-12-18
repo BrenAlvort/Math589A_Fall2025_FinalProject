@@ -2,7 +2,6 @@ import numpy as np
 
 # =========================================================
 # 1. Power method for dominant eigenpair (symmetric matrix)
-#    (kept for completeness / assignment API; not used in features)
 # =========================================================
 def power_method(A, x0, maxit, tol):
     A = np.asarray(A, dtype=float)
@@ -13,12 +12,11 @@ def power_method(A, x0, maxit, tol):
     x = np.asarray(x0, dtype=float).reshape(-1)
     if x.size != n:
         raise ValueError("x0 must have shape (n,)")
-
     nx = np.linalg.norm(x)
     if nx == 0:
         x = np.ones(n, dtype=float)
         nx = np.linalg.norm(x)
-    x /= nx
+    x = x / nx
 
     lam_old = None
     lam = float(x @ (A @ x))
@@ -40,7 +38,7 @@ def power_method(A, x0, maxit, tol):
 
 
 # =========================================================
-# 2. Rank-k image approximation using SVD (numpy, stable)
+# 2. Rank-k image approximation using SVD
 # =========================================================
 def svd_compress(image, k):
     A = np.asarray(image, dtype=float)
@@ -59,14 +57,12 @@ def svd_compress(image, k):
 
 
 # =========================================================
-# 3. Feature extraction (fast + stable + matches your working style)
+# 3. Features (your proven one)
 # =========================================================
 def svd_features(image, p, tol=1e-12):
     """
-    Feature vector length = p + 2:
-        [ s1/sum(s), ..., sp/sum(s), r90, r95 ]
-    where r_alpha is the smallest r such that:
-        sum_{i=1}^r s_i^2 >= alpha * sum_i s_i^2
+    Feature vector length p+2:
+      [ s1/sum(s), ..., sp/sum(s), r90, r95 ]
     """
     A = np.asarray(image, dtype=float)
     if A.ndim != 2:
@@ -81,10 +77,10 @@ def svd_features(image, p, tol=1e-12):
     s_sum = float(np.sum(s))
     lead = (s[:p] / s_sum) if s_sum > tol else np.zeros(p, dtype=float)
 
-    s2 = s * s
-    total = float(np.sum(s2))
+    e = s * s
+    total = float(np.sum(e))
     if total > tol:
-        c = np.cumsum(s2) / total
+        c = np.cumsum(e) / total
         r90 = float(np.searchsorted(c, 0.90) + 1)
         r95 = float(np.searchsorted(c, 0.95) + 1)
     else:
@@ -95,13 +91,9 @@ def svd_features(image, p, tol=1e-12):
 
 
 # =========================================================
-# 4. LDA training (robust ridge + tiny CV threshold nudge)
+# Helper: fit standard LDA core (full covariance + ridge)
 # =========================================================
 def _lda_fit_core(X, y01):
-    """
-    y01 must be in {0,1}.
-    Returns w, mu0, mu1, m0, m1.
-    """
     X0 = X[y01 == 0]
     X1 = X[y01 == 1]
     if X0.shape[0] == 0 or X1.shape[0] == 0:
@@ -116,15 +108,13 @@ def _lda_fit_core(X, y01):
 
     d = Sw.shape[0]
     tr = float(np.trace(Sw))
-    # Slightly stronger/safer ridge than ultra-tiny values
-    lam = 1e-5 * (tr / d if d > 0 else 1.0) + 1e-12
+    lam = 1e-6 * (tr / d if d > 0 else 1.0) + 1e-12
     Sw = Sw + lam * np.eye(d)
 
     w = np.linalg.solve(Sw, (mu1 - mu0))
     m0 = float(mu0 @ w)
     m1 = float(mu1 @ w)
 
-    # enforce m1 >= m0 so ">= threshold => class 1" is consistent
     if m1 < m0:
         w = -w
         m0, m1 = -m0, -m1
@@ -132,13 +122,10 @@ def _lda_fit_core(X, y01):
     return w, mu0, mu1, m0, m1
 
 
+# =========================================================
+# 4. LDA train with finer CV-tuned threshold bias
+# =========================================================
 def lda_train(X, y):
-    """
-    Trains LDA (full covariance) and adds a very small, CV-chosen threshold shift:
-        threshold = 0.5*(m0+m1) + bf*(m1-m0)
-    where bf is chosen from a tiny grid by deterministic K-fold CV.
-    If shifting hurts, CV chooses bf=0 automatically.
-    """
     X = np.asarray(X, dtype=float)
     y = np.asarray(y).reshape(-1)
     if X.ndim != 2:
@@ -149,19 +136,16 @@ def lda_train(X, y):
     classes = np.unique(y)
     if classes.size != 2:
         raise ValueError("lda_train expects exactly two classes")
-
-    # deterministic mapping to {0,1}: larger label => 1
     y01 = (y == classes.max()).astype(int)
 
     N = X.shape[0]
     idx = np.arange(N)
-
-    # deterministic folds (no RNG): this is important for autograder stability
     K = 5 if N >= 80 else 3
     folds = np.array_split(idx, K)
 
-    # Tiny bias grid: designed to flip at most a couple borderline points
-    bias_factors = np.array([-0.03, -0.015, 0.0, 0.015, 0.03], dtype=float)
+    # Finer grid than before (small, safe, and still fast)
+    bias_factors = np.array([-0.05, -0.04, -0.03, -0.02, -0.01, 0.0,
+                             0.01, 0.02, 0.03, 0.04, 0.05], dtype=float)
 
     best_bf = 0.0
     best_acc = -1.0
@@ -193,12 +177,16 @@ def lda_train(X, y):
 
         if total > 0:
             acc = correct / total
-            # tie-break: prefer smaller |bf| (more conservative)
-            if acc > best_acc + 1e-12 or (abs(acc - best_acc) <= 1e-12 and abs(bf) < abs(best_bf)):
+
+            # tie-break 1: higher CV accuracy
+            # tie-break 2: smaller |bf|
+            # tie-break 3: if still tied, prefer slightly negative bf
+            if (acc > best_acc + 1e-12 or
+                (abs(acc - best_acc) <= 1e-12 and abs(bf) < abs(best_bf)) or
+                (abs(acc - best_acc) <= 1e-12 and abs(bf) == abs(best_bf) and bf < best_bf)):
                 best_acc = acc
                 best_bf = bf
 
-    # fit on full data with chosen bias
     w, mu0, mu1, m0, m1 = _lda_fit_core(X, y01)
     base_thr = 0.5 * (m0 + m1)
     sep = max(m1 - m0, 1e-12)
@@ -208,7 +196,7 @@ def lda_train(X, y):
 
 
 # =========================================================
-# 5. LDA prediction
+# 5. LDA predict
 # =========================================================
 def lda_predict(X, w, threshold):
     X = np.asarray(X, dtype=float)
@@ -217,9 +205,7 @@ def lda_predict(X, w, threshold):
         raise ValueError("X must be a 2D array")
     if X.shape[1] != w.size:
         raise ValueError("Dimension mismatch between X and w")
-
-    z = X @ w
-    return (z >= float(threshold)).astype(int)
+    return (X @ w >= float(threshold)).astype(int)
 
 
 # =========================================================
@@ -244,11 +230,9 @@ def _example_run():
     w, thr = lda_train(Xf_train, y_train)
     y_pred = lda_predict(Xf_test, w, thr)
 
-    # If y_test is already 0/1, this is correct:
-    acc = float(np.mean(y_pred == y_test))
+    acc = float(np.mean(y_pred == (y_test == np.max(np.unique(y_test))).astype(int)))
     print(f"Example test accuracy: {acc:.3f}")
 
 
 if __name__ == "__main__":
     _example_run()
-
