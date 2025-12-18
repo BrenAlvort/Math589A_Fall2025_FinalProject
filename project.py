@@ -11,8 +11,7 @@ def power_method(A, x0, maxit, tol):
 
     x = np.asarray(x0, dtype=float).reshape(-1)
     if x.size != n:
-        raise ValueError("x0 must have shape (n,)")
-
+        raise ValueError("x0 must have length n")
     nx = np.linalg.norm(x)
     if nx == 0:
         x = np.ones(n, dtype=float)
@@ -48,7 +47,6 @@ def svd_compress(image, k):
         raise ValueError("image must be 2D")
     m, n = A.shape
     r = min(m, n)
-
     k = int(k)
     if not (1 <= k <= r):
         raise ValueError(f"k must be in [1,{r}]")
@@ -63,61 +61,70 @@ def svd_compress(image, k):
 
 
 # =========================================================
-# 3. Block roughness features (simple but stable)
+# 3. Feature extractors you can test locally
 # =========================================================
-def block_roughness_features(image, block_size=8, tol=1e-12):
+def _svd_spectrum(image):
     A = np.asarray(image, dtype=float)
     if A.ndim != 2:
         raise ValueError("image must be 2D")
-    H, W = A.shape
-    b = int(block_size)
-    if b < 2:
-        raise ValueError("block_size must be >= 2")
-
-    # use only full blocks
-    Hc = (H // b) * b
-    Wc = (W // b) * b
-    if Hc == 0 or Wc == 0:
-        return np.array([0.0, 0.0, 0.0], dtype=float)
-
-    A = A[:Hc, :Wc]
-    blocks = A.reshape(Hc // b, b, Wc // b, b)
-
-    dx = blocks[:, :, :, 1:] - blocks[:, :, :, :-1]
-    dy = blocks[:, 1:, :, :] - blocks[:, :-1, :, :]
-
-    r = np.mean(dx * dx, axis=(1, 3)) + np.mean(dy * dy, axis=(1, 3))
-    r = r.reshape(-1)
-    if r.size == 0:
-        return np.array([0.0, 0.0, 0.0], dtype=float)
-
-    return np.array([float(r.mean()), float(r.std()), float(r.max())], dtype=float)
+    return np.linalg.svd(A, full_matrices=False, compute_uv=False)
 
 
-# =========================================================
-# 4. SVD + energy ranks + roughness (single feature choice)
-# =========================================================
-def svd_features(image, p, tol=1e-12):
+def svd_features_cumsum_s(image, p, tol=1e-12):
     """
-    Feature vector length: p + 2 + 3
-
-      - First p entries: normalized top singular values  s[:p]/sum(s)
-      - Next 2 entries:  r95, r99 using squared-energy cumulative
-      - Last 3 entries:  block roughness mean/std/max
-
-    This is intentionally "middle ground": not many knobs, but not minimal either.
+    "0.7-style": cumulative proportions of singular values:
+      feat = [cumsum(s)/sum(s)][:p] + [r_0.9, r_0.95]
     """
-    A = np.asarray(image, dtype=float)
-    if A.ndim != 2:
-        raise ValueError("image must be a 2D array")
-
-    m, n = A.shape
-    rmax = min(m, n)
+    s = _svd_spectrum(image)
+    r = s.size
     p = int(p)
-    if not (1 <= p <= rmax):
-        raise ValueError(f"p must satisfy 1 <= p <= {rmax}")
+    if not (1 <= p <= r):
+        raise ValueError(f"p must be in [1,{r}]")
 
-    s = np.linalg.svd(A, full_matrices=False, compute_uv=False)
+    s_sum = float(np.sum(s))
+    if s_sum > tol:
+        cum = np.cumsum(s) / s_sum
+    else:
+        cum = np.zeros_like(s, dtype=float)
+
+    r09 = float(np.searchsorted(cum, 0.90) + 1)
+    r095 = float(np.searchsorted(cum, 0.95) + 1)
+    return np.hstack((cum[:p], [r09, r095])).astype(float)
+
+
+def svd_features_cumsum_s2(image, p, tol=1e-12):
+    """
+    Energy variant: cumulative proportions of squared singular values:
+      feat = [cumsum(s^2)/sum(s^2)][:p] + [r_0.9, r_0.95]
+    """
+    s = _svd_spectrum(image)
+    r = s.size
+    p = int(p)
+    if not (1 <= p <= r):
+        raise ValueError(f"p must be in [1,{r}]")
+
+    e = s * s
+    e_sum = float(np.sum(e))
+    if e_sum > tol:
+        cum = np.cumsum(e) / e_sum
+    else:
+        cum = np.zeros_like(e, dtype=float)
+
+    r09 = float(np.searchsorted(cum, 0.90) + 1)
+    r095 = float(np.searchsorted(cum, 0.95) + 1)
+    return np.hstack((cum[:p], [r09, r095])).astype(float)
+
+
+def svd_features_topnorm_s_energy_ranks(image, p, tol=1e-12):
+    """
+    Standard: normalized top singular values + energy ranks.
+      feat = [s1/sum(s),...,sp/sum(s)] + [r_0.9, r_0.95] based on s^2
+    """
+    s = _svd_spectrum(image)
+    r = s.size
+    p = int(p)
+    if not (1 <= p <= r):
+        raise ValueError(f"p must be in [1,{r}]")
 
     s_sum = float(np.sum(s))
     top = (s[:p] / s_sum) if s_sum > tol else np.zeros(p, dtype=float)
@@ -125,20 +132,27 @@ def svd_features(image, p, tol=1e-12):
     e = s * s
     e_sum = float(np.sum(e))
     if e_sum > tol:
-        c = np.cumsum(e) / e_sum
-        r95 = float(np.searchsorted(c, 0.95) + 1)
-        r99 = float(np.searchsorted(c, 0.99) + 1)
+        cum = np.cumsum(e) / e_sum
+        r09 = float(np.searchsorted(cum, 0.90) + 1)
+        r095 = float(np.searchsorted(cum, 0.95) + 1)
     else:
-        r95 = 0.0
-        r99 = 0.0
+        r09 = 0.0
+        r095 = 0.0
 
-    rough = block_roughness_features(A, block_size=8, tol=tol)
-
-    return np.concatenate([top, np.array([r95, r99], dtype=float), rough])
+    return np.concatenate([top, np.array([r09, r095], dtype=float)])
 
 
 # =========================================================
-# 5. Two-class LDA: training (label-robust + ridge)
+# Pick ONE feature function for submission API
+# =========================================================
+def svd_features(image, p):
+    # Default to the simple cumsum(s) style as a baseline.
+    return svd_features_cumsum_s(image, p)
+
+
+# =========================================================
+# 4. Two-class LDA: training (stable + label-robust)
+#     Small improvement: include class priors in the intercept
 # =========================================================
 def lda_train(X, y):
     X = np.asarray(X, dtype=float)
@@ -146,13 +160,11 @@ def lda_train(X, y):
     if X.ndim != 2:
         raise ValueError("X must be 2D")
     if y.size != X.shape[0]:
-        raise ValueError("y must have length N")
+        raise ValueError("y must match X rows")
 
     classes = np.unique(y)
     if classes.size != 2:
         raise ValueError("lda_train expects exactly two classes")
-
-    # deterministic mapping to {0,1}
     y01 = (y == classes.max()).astype(int)
 
     X0 = X[y01 == 0]
@@ -174,61 +186,96 @@ def lda_train(X, y):
 
     w = np.linalg.solve(Sw_reg, (mu1 - mu0))
 
-    m0 = float(mu0 @ w)
-    m1 = float(mu1 @ w)
-    threshold = 0.5 * (m0 + m1)
+    # Bayes LDA intercept with empirical class priors
+    n0 = X0.shape[0]
+    n1 = X1.shape[0]
+    pi0 = n0 / (n0 + n1)
+    pi1 = n1 / (n0 + n1)
+    log_prior = np.log(max(pi1, 1e-15) / max(pi0, 1e-15))
 
-    # ensure rule ">= threshold => class 1"
+    # b = -0.5 * (mu1 + mu0)^T w + log(pi1/pi0)
+    b = -0.5 * float((mu1 + mu0) @ w) + float(log_prior)
+
+    # ensure "score >= 0 => class 1" is consistent with direction
+    m0 = float(mu0 @ w + b)
+    m1 = float(mu1 @ w + b)
     if m1 < m0:
         w = -w
-        threshold = -threshold
+        b = -b
 
-    return w, float(threshold)
+    return w, float(b)
 
 
 # =========================================================
-# 6. Two-class LDA: prediction
+# 5. Two-class LDA: prediction
 # =========================================================
-def lda_predict(X, w, threshold):
+def lda_predict(X, w, b):
     X = np.asarray(X, dtype=float)
     w = np.asarray(w, dtype=float).reshape(-1)
     if X.ndim != 2:
         raise ValueError("X must be 2D")
     if X.shape[1] != w.size:
-        raise ValueError("Dimension mismatch between X and w")
-    return (X @ w >= float(threshold)).astype(int)
+        raise ValueError("dimension mismatch X and w")
+    return (X @ w + float(b) >= 0.0).astype(int)
 
 
 # =========================================================
-# Local smoke test (optional)
+# Local: evaluate variants on a held-out split
 # =========================================================
-def _example_run():
-    try:
-        data = np.load("project_data_example.npz")
-    except OSError:
-        print("No example dataset found (project_data_example.npz).")
-        return
+def _build_features(X_imgs, p, feat_fn):
+    return np.vstack([feat_fn(img, p) for img in X_imgs])
 
-    X_train = data["X_train"]
-    y_train = data["y_train"]
-    X_test = data["X_test"]
-    y_test = data["y_test"]
 
-    p = min(32, min(X_train.shape[1], X_train.shape[2]))
+def _acc(y_pred, y_true, y_train_ref):
+    classes = np.unique(y_train_ref)
+    y_true01 = (y_true == classes.max()).astype(int)
+    return float(np.mean(y_pred == y_true01))
 
-    Xf_train = np.vstack([svd_features(img, p) for img in X_train])
-    Xf_test = np.vstack([svd_features(img, p) for img in X_test])
 
-    w, thr = lda_train(Xf_train, y_train)
-    y_pred = lda_predict(Xf_test, w, thr)
+def _tune_locally(npz_path="project_data_example.npz", seed=0, val_frac=0.2):
+    data = np.load(npz_path)
+    X = data["X_train"]
+    y = data["y_train"]
 
-    # map y_test to {0,1} consistently with training
-    classes = np.unique(y_train)
-    y_test01 = (y_test == classes.max()).astype(int)
+    N = X.shape[0]
+    rng = np.random.default_rng(seed)
+    perm = rng.permutation(N)
+    nval = max(1, int(round(val_frac * N)))
+    va_idx = perm[:nval]
+    tr_idx = perm[nval:]
 
-    acc = float(np.mean(y_pred == y_test01))
-    print(f"Example test accuracy: {acc:.3f}")
+    Xtr, ytr = X[tr_idx], y[tr_idx]
+    Xva, yva = X[va_idx], y[va_idx]
+
+    p = min(20, min(X.shape[1], X.shape[2]))
+
+    candidates = [
+        ("cumsum(s)", svd_features_cumsum_s),
+        ("cumsum(s^2)", svd_features_cumsum_s2),
+        ("topnorm(s)+energy ranks", svd_features_topnorm_s_energy_ranks),
+    ]
+
+    results = []
+    for name, feat_fn in candidates:
+        Xf_tr = _build_features(Xtr, p, feat_fn)
+        Xf_va = _build_features(Xva, p, feat_fn)
+
+        w, b = lda_train(Xf_tr, ytr)
+        yhat = lda_predict(Xf_va, w, b)
+        acc = _acc(yhat, yva, ytr)
+        results.append((name, acc))
+
+    results.sort(key=lambda t: t[1], reverse=True)
+    print("Validation results:")
+    for name, acc in results:
+        print(f"  {name:22s}  acc={acc:.4f}")
+
+    print("\nSet svd_features(...) to your best-performing feature extractor above.")
 
 
 if __name__ == "__main__":
-    _example_run()
+    # Comment this out for submission; use locally only.
+    try:
+        _tune_locally("project_data_example.npz", seed=0, val_frac=0.2)
+    except Exception as e:
+        print("Local tuning skipped:", e)
