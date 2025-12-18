@@ -21,7 +21,6 @@ def power_method(A, x0, maxit, tol):
     lam_prev = float(x @ (A @ x))
     eps = np.finfo(float).eps
 
-    iters = 0
     for iters in range(1, int(maxit) + 1):
         y = A @ x
         ny = np.linalg.norm(y)
@@ -47,8 +46,7 @@ def svd_compress(image, k):
         raise ValueError("image must be 2D")
     m, n = A.shape
     r = min(m, n)
-    k = int(k)
-    if not (1 <= k <= r):
+    if not (1 <= int(k) <= r):
         raise ValueError(f"k must be in [1,{r}]")
 
     U, s, Vt = np.linalg.svd(A, full_matrices=False)
@@ -61,25 +59,23 @@ def svd_compress(image, k):
 
 
 # =========================================================
-# 3. Feature extractors you can test locally
+# 3. SVD-based features (moderate, stable choice)
 # =========================================================
-def _svd_spectrum(image):
+def svd_features(image, p, tol=1e-12):
+    """
+    Features:
+      - cumulative proportions of singular values (length p)
+      - r_0.9, r_0.95 based on squared singular values
+    """
     A = np.asarray(image, dtype=float)
     if A.ndim != 2:
         raise ValueError("image must be 2D")
-    return np.linalg.svd(A, full_matrices=False, compute_uv=False)
 
-
-def svd_features_cumsum_s(image, p, tol=1e-12):
-    """
-    "0.7-style": cumulative proportions of singular values:
-      feat = [cumsum(s)/sum(s)][:p] + [r_0.9, r_0.95]
-    """
-    s = _svd_spectrum(image)
+    s = np.linalg.svd(A, compute_uv=False)
     r = s.size
-    p = int(p)
-    if not (1 <= p <= r):
+    if not (1 <= int(p) <= r):
         raise ValueError(f"p must be in [1,{r}]")
+    p = int(p)
 
     s_sum = float(np.sum(s))
     if s_sum > tol:
@@ -87,72 +83,21 @@ def svd_features_cumsum_s(image, p, tol=1e-12):
     else:
         cum = np.zeros_like(s, dtype=float)
 
-    r09 = float(np.searchsorted(cum, 0.90) + 1)
-    r095 = float(np.searchsorted(cum, 0.95) + 1)
-    return np.hstack((cum[:p], [r09, r095])).astype(float)
-
-
-def svd_features_cumsum_s2(image, p, tol=1e-12):
-    """
-    Energy variant: cumulative proportions of squared singular values:
-      feat = [cumsum(s^2)/sum(s^2)][:p] + [r_0.9, r_0.95]
-    """
-    s = _svd_spectrum(image)
-    r = s.size
-    p = int(p)
-    if not (1 <= p <= r):
-        raise ValueError(f"p must be in [1,{r}]")
-
     e = s * s
     e_sum = float(np.sum(e))
     if e_sum > tol:
-        cum = np.cumsum(e) / e_sum
+        ecum = np.cumsum(e) / e_sum
+        r90 = float(np.searchsorted(ecum, 0.90) + 1)
+        r95 = float(np.searchsorted(ecum, 0.95) + 1)
     else:
-        cum = np.zeros_like(e, dtype=float)
+        r90 = 0.0
+        r95 = 0.0
 
-    r09 = float(np.searchsorted(cum, 0.90) + 1)
-    r095 = float(np.searchsorted(cum, 0.95) + 1)
-    return np.hstack((cum[:p], [r09, r095])).astype(float)
-
-
-def svd_features_topnorm_s_energy_ranks(image, p, tol=1e-12):
-    """
-    Standard: normalized top singular values + energy ranks.
-      feat = [s1/sum(s),...,sp/sum(s)] + [r_0.9, r_0.95] based on s^2
-    """
-    s = _svd_spectrum(image)
-    r = s.size
-    p = int(p)
-    if not (1 <= p <= r):
-        raise ValueError(f"p must be in [1,{r}]")
-
-    s_sum = float(np.sum(s))
-    top = (s[:p] / s_sum) if s_sum > tol else np.zeros(p, dtype=float)
-
-    e = s * s
-    e_sum = float(np.sum(e))
-    if e_sum > tol:
-        cum = np.cumsum(e) / e_sum
-        r09 = float(np.searchsorted(cum, 0.90) + 1)
-        r095 = float(np.searchsorted(cum, 0.95) + 1)
-    else:
-        r09 = 0.0
-        r095 = 0.0
-
-    return np.concatenate([top, np.array([r09, r095], dtype=float)])
+    return np.hstack((cum[:p], [r90, r95])).astype(float)
 
 
 # =========================================================
-# Pick ONE feature function for submission API
-# =========================================================
-def svd_features(image, p):
-    # Default to the simple cumsum(s) style as a baseline.
-    return svd_features_cumsum_s(image, p)
-
-
-# =========================================================
-# 4. Two-class LDA: training (stable + label-robust)
-#     Small improvement: include class priors in the intercept
+# 4. Two-class LDA (Bayes-consistent intercept)
 # =========================================================
 def lda_train(X, y):
     X = np.asarray(X, dtype=float)
@@ -182,24 +127,18 @@ def lda_train(X, y):
     d = Sw.shape[0]
     tr = float(np.trace(Sw))
     lam = 1e-6 * (tr / d if d > 0 else 1.0) + 1e-12
-    Sw_reg = Sw + lam * np.eye(d)
+    Sw += lam * np.eye(d)
 
-    w = np.linalg.solve(Sw_reg, (mu1 - mu0))
+    w = np.linalg.solve(Sw, (mu1 - mu0))
 
-    # Bayes LDA intercept with empirical class priors
-    n0 = X0.shape[0]
-    n1 = X1.shape[0]
+    # Bayes LDA intercept with empirical priors
+    n0, n1 = X0.shape[0], X1.shape[0]
     pi0 = n0 / (n0 + n1)
     pi1 = n1 / (n0 + n1)
-    log_prior = np.log(max(pi1, 1e-15) / max(pi0, 1e-15))
+    b = -0.5 * float((mu1 + mu0) @ w) + np.log(max(pi1, 1e-15) / max(pi0, 1e-15))
 
-    # b = -0.5 * (mu1 + mu0)^T w + log(pi1/pi0)
-    b = -0.5 * float((mu1 + mu0) @ w) + float(log_prior)
-
-    # ensure "score >= 0 => class 1" is consistent with direction
-    m0 = float(mu0 @ w + b)
-    m1 = float(mu1 @ w + b)
-    if m1 < m0:
+    # Ensure correct orientation
+    if (mu1 @ w + b) < (mu0 @ w + b):
         w = -w
         b = -b
 
@@ -207,7 +146,7 @@ def lda_train(X, y):
 
 
 # =========================================================
-# 5. Two-class LDA: prediction
+# 5. Two-class LDA prediction
 # =========================================================
 def lda_predict(X, w, b):
     X = np.asarray(X, dtype=float)
@@ -220,62 +159,32 @@ def lda_predict(X, w, b):
 
 
 # =========================================================
-# Local: evaluate variants on a held-out split
+# Local smoke test (NOT used by autograder)
 # =========================================================
-def _build_features(X_imgs, p, feat_fn):
-    return np.vstack([feat_fn(img, p) for img in X_imgs])
+def _example_run():
+    try:
+        data = np.load("project_data_example.npz")
+    except OSError:
+        print("No example dataset found.")
+        return
 
+    X_train = data["X_train"]
+    y_train = data["y_train"]
+    X_test = data["X_test"]
+    y_test = data["y_test"]
 
-def _acc(y_pred, y_true, y_train_ref):
-    classes = np.unique(y_train_ref)
-    y_true01 = (y_true == classes.max()).astype(int)
-    return float(np.mean(y_pred == y_true01))
+    p = min(20, min(X_train.shape[1], X_train.shape[2]))
+    Xf_train = np.vstack([svd_features(img, p) for img in X_train])
+    Xf_test = np.vstack([svd_features(img, p) for img in X_test])
 
+    w, b = lda_train(Xf_train, y_train)
+    y_pred = lda_predict(Xf_test, w, b)
 
-def _tune_locally(npz_path="project_data_example.npz", seed=0, val_frac=0.2):
-    data = np.load(npz_path)
-    X = data["X_train"]
-    y = data["y_train"]
-
-    N = X.shape[0]
-    rng = np.random.default_rng(seed)
-    perm = rng.permutation(N)
-    nval = max(1, int(round(val_frac * N)))
-    va_idx = perm[:nval]
-    tr_idx = perm[nval:]
-
-    Xtr, ytr = X[tr_idx], y[tr_idx]
-    Xva, yva = X[va_idx], y[va_idx]
-
-    p = min(20, min(X.shape[1], X.shape[2]))
-
-    candidates = [
-        ("cumsum(s)", svd_features_cumsum_s),
-        ("cumsum(s^2)", svd_features_cumsum_s2),
-        ("topnorm(s)+energy ranks", svd_features_topnorm_s_energy_ranks),
-    ]
-
-    results = []
-    for name, feat_fn in candidates:
-        Xf_tr = _build_features(Xtr, p, feat_fn)
-        Xf_va = _build_features(Xva, p, feat_fn)
-
-        w, b = lda_train(Xf_tr, ytr)
-        yhat = lda_predict(Xf_va, w, b)
-        acc = _acc(yhat, yva, ytr)
-        results.append((name, acc))
-
-    results.sort(key=lambda t: t[1], reverse=True)
-    print("Validation results:")
-    for name, acc in results:
-        print(f"  {name:22s}  acc={acc:.4f}")
-
-    print("\nSet svd_features(...) to your best-performing feature extractor above.")
+    classes = np.unique(y_train)
+    y_test01 = (y_test == classes.max()).astype(int)
+    acc = np.mean(y_pred == y_test01)
+    print(f"Example accuracy: {acc:.3f}")
 
 
 if __name__ == "__main__":
-    # Comment this out for submission; use locally only.
-    try:
-        _tune_locally("project_data_example.npz", seed=0, val_frac=0.2)
-    except Exception as e:
-        print("Local tuning skipped:", e)
+    _example_run()
