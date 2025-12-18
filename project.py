@@ -51,27 +51,26 @@ def svd_compress(image, k):
     U, s, Vt = np.linalg.svd(A, full_matrices=False)
     r = s.size
     k_eff = int(min(k, r))
-
     Ak = (U[:, :k_eff] * s[:k_eff]) @ Vt[:k_eff, :]
 
     denom = np.linalg.norm(A, ord="fro")
     rel_error = 0.0 if denom == 0 else float(np.linalg.norm(A - Ak, ord="fro") / denom)
-
     return Ak, rel_error
 
 
 # =========================================================
-# 3. Feature vector from image singular values (aggressive but stable)
+# 3. Feature vector from image singular values (head+tail)
 # =========================================================
 def svd_features(image, p, tol=1e-12):
     """
     Feature vector (length p+2):
 
-      lead[i] = cumulative_energy[i] = (sum_{j<=i} sigma_j^2) / (sum_j sigma_j^2)
-      extra 1 = spectral_entropy of normalized energy distribution
-      extra 2 = effective_rank = exp(entropy)
+      first p_head entries:   head singular values normalized by Frobenius norm
+      next  p_tail entries:   tail singular values normalized by Frobenius norm
+      extra1: spectral entropy of energy proportions
+      extra2: effective rank = exp(entropy)
 
-    All are scale-invariant and smoother than discrete rank cutoffs.
+    This captures BOTH global structure (head) and texture/noise (tail).
     """
     A = np.asarray(image, dtype=np.float64)
     if A.ndim != 2:
@@ -83,18 +82,31 @@ def svd_features(image, p, tol=1e-12):
         raise ValueError("p must satisfy 1 <= p <= min(m,n)")
 
     S = np.linalg.svd(A, full_matrices=False, compute_uv=False)
+
+    # Frobenius energy and stability
     e = S * S
     tot = float(e.sum())
-
     if tot <= tol:
         return np.zeros(p + 2, dtype=np.float32)
 
-    # Cumulative energy profile (very robust)
-    cum = np.cumsum(e) / tot
-    lead = cum[:p].astype(np.float32, copy=False)
+    frob = np.sqrt(tot)
 
-    # Spectral entropy + effective rank (continuous, informative)
-    # p_i are energy proportions; entropy H = -sum p_i log p_i
+    # Split budget
+    p_head = p // 2
+    p_tail = p - p_head
+
+    head = (S[:p_head] / frob) if p_head > 0 else np.empty((0,), dtype=np.float64)
+
+    # Tail: take the smallest singular values (texture/noise regime)
+    # Reverse end ensures we include the tiniest values first.
+    if p_tail > 0:
+        tail = (S[-p_tail:] / frob)
+    else:
+        tail = np.empty((0,), dtype=np.float64)
+
+    lead = np.concatenate([head, tail]).astype(np.float32, copy=False)
+
+    # Spectral entropy (continuous, stable)
     pi = e / tot
     eps = 1e-12
     H = -float(np.sum(pi * np.log(pi + eps)))
@@ -104,17 +116,11 @@ def svd_features(image, p, tol=1e-12):
 
 
 # =========================================================
-# 4. Two-class LDA: training (mild shrinkage)
+# 4. Two-class LDA training (simple + mild shrinkage)
 # =========================================================
 def lda_train(X, y):
-    """
-    LDA with mild covariance shrinkage:
-      Sw_shrunk = (1-gamma) Sw + gamma * (tr(Sw)/d) I
-    This often improves generalization slightly without destabilizing.
-    """
     X = np.asarray(X, dtype=np.float64)
     y = np.asarray(y).reshape(-1)
-
     if X.ndim != 2:
         raise ValueError("X must be a 2D array")
     if y.size != X.shape[0]:
@@ -137,11 +143,11 @@ def lda_train(X, y):
     if tr <= 0.0:
         tr = 1.0
 
-    # mild shrinkage (small gamma to avoid “distribution cliff”)
-    gamma = 0.06
+    # Mild shrinkage: improves generalization without being “fancy”
+    gamma = 0.05
     Sw = (1.0 - gamma) * Sw + gamma * (tr / d) * np.eye(d, dtype=np.float64)
 
-    # tiny diagonal loading
+    # Tiny diagonal loading for numerical safety
     Sw = Sw + (1e-8 * tr / d) * np.eye(d, dtype=np.float64)
 
     w = np.linalg.solve(Sw, (mu1 - mu0))
@@ -150,6 +156,7 @@ def lda_train(X, y):
     m1 = float(mu1 @ w)
     threshold = 0.5 * (m0 + m1)
 
+    # Ensure class-1 scores higher for >= rule
     if m1 < m0:
         w = -w
         threshold = -threshold
@@ -158,7 +165,7 @@ def lda_train(X, y):
 
 
 # =========================================================
-# 5. Two-class LDA: prediction
+# 5. Prediction
 # =========================================================
 def lda_predict(X, w, threshold):
     X = np.asarray(X, dtype=np.float64)
@@ -181,9 +188,9 @@ def _example_run():
     X_test = data["X_test"]
     y_test = data["y_test"]
 
-    p = min(20, min(X_train.shape[1], X_train.shape[2]))
+    p = min(32, min(X_train.shape[1], X_train.shape[2]))
     Xf_train = np.vstack([svd_features(img, p) for img in X_train])
-    Xf_test  = np.vstack([svd_features(img, p) for img in X_test])
+    Xf_test = np.vstack([svd_features(img, p) for img in X_test])
 
     w, thr = lda_train(Xf_train, y_train)
     y_pred = lda_predict(Xf_test, w, thr)
@@ -192,4 +199,3 @@ def _example_run():
 
 if __name__ == "__main__":
     _example_run()
-
