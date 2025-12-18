@@ -1,9 +1,13 @@
 import numpy as np
 
 # =========================================================
-# 1. Power method for dominant eigenpair (symmetric matrix)
+# 1. Power method for dominant eigenpair
 # =========================================================
-def power_method(A, x0, maxit, tol):
+def power_method(A: np.ndarray, x0: np.ndarray, maxit: int, tol: float):
+    """
+    Approximate dominant eigenvalue/eigenvector of (assumed) real symmetric A.
+    Returns (lam, v, iters).
+    """
     A = np.asarray(A, dtype=float)
     if A.ndim != 2 or A.shape[0] != A.shape[1]:
         raise ValueError("A must be a square matrix")
@@ -11,89 +15,115 @@ def power_method(A, x0, maxit, tol):
 
     x = np.asarray(x0, dtype=float).reshape(-1)
     if x.size != n:
-        raise ValueError("x0 must have shape (n,)")
+        raise ValueError("x0 must have length n")
     nx = np.linalg.norm(x)
     if nx == 0:
         x = np.ones(n, dtype=float)
         nx = np.linalg.norm(x)
-    x = x / nx
+    x /= nx
 
-    lam_old = None
-    lam = float(x @ (A @ x))
+    lam_prev = float(x @ (A @ x))
+    eps = np.finfo(float).eps
 
-    for _ in range(int(maxit)):
-        z = A @ x
-        nz = np.linalg.norm(z)
-        if nz == 0:
-            return 0.0, x
-        x = z / nz
+    iters = 0
+    for iters in range(1, int(maxit) + 1):
+        y = A @ x
+        ny = np.linalg.norm(y)
+        if ny == 0:
+            return 0.0, x, iters
+        x = y / ny
 
         lam = float(x @ (A @ x))
-        if lam_old is not None:
-            if abs(lam - lam_old) <= tol * max(1.0, abs(lam)):
-                break
-        lam_old = lam
+        rel_err = abs(lam - lam_prev) / max(abs(lam), eps)
+        if rel_err < tol:
+            return lam, x, iters
+        lam_prev = lam
 
-    return lam, x
+    return lam_prev, x, iters
 
 
 # =========================================================
-# 2. Rank-k image approximation using SVD
+# 2. Rank-k image compression via SVD
 # =========================================================
-def svd_compress(image, k):
+def svd_compress(image: np.ndarray, k: int):
+    """
+    Returns (image_k, rel_error, compression_ratio).
+    """
+    image = np.asarray(image, dtype=float)
+    if image.ndim != 2:
+        raise ValueError("image must be 2D")
+    m, n = image.shape
+    rmax = min(m, n)
+    if not (1 <= k <= rmax):
+        raise ValueError(f"k must be in [1, {rmax}]")
+
+    U, s, Vh = np.linalg.svd(image, full_matrices=False)
+    image_k = (U[:, :k] * s[:k]) @ Vh[:k, :]
+
+    denom = np.linalg.norm(image, ord="fro")
+    rel_error = 0.0 if denom == 0 else float(np.linalg.norm(image - image_k, ord="fro") / denom)
+    compression_ratio = float(k * (m + n + 1) / (m * n))
+
+    return image_k, rel_error, compression_ratio
+
+
+# =========================================================
+# 3. SVD-based feature extraction (corrected)
+# =========================================================
+def svd_features(image: np.ndarray, p: int, tol: float = 1e-12):
+    """
+    Feature vector:
+      [ s1/sum(s), ..., sp/sum(s), r_0.9, r_0.95 ]
+    where r_alpha is smallest r with sum_{i<=r} s_i^2 >= alpha * sum_i s_i^2.
+    """
     A = np.asarray(image, dtype=float)
     if A.ndim != 2:
-        raise ValueError("image must be a 2D array")
-    if k < 1:
-        raise ValueError("k must be >= 1")
-
-    U, s, Vt = np.linalg.svd(A, full_matrices=False)
-    k_eff = int(min(k, s.size))
-    Ak = (U[:, :k_eff] * s[:k_eff]) @ Vt[:k_eff, :]
-
-    denom = np.linalg.norm(A, ord="fro")
-    rel_error = 0.0 if denom == 0 else float(np.linalg.norm(A - Ak, ord="fro") / denom)
-    return Ak, rel_error
-
-
-# =========================================================
-# 3. Features (your proven one)
-# =========================================================
-def svd_features(image, p, tol=1e-12):
-    """
-    Feature vector length p+2:
-      [ s1/sum(s), ..., sp/sum(s), r90, r95 ]
-    """
-    A = np.asarray(image, dtype=float)
-    if A.ndim != 2:
-        raise ValueError("image must be a 2D array")
+        raise ValueError("image must be 2D")
     m, n = A.shape
     rmax = min(m, n)
-    if p < 1 or p > rmax:
-        raise ValueError("p must satisfy 1 <= p <= min(m,n)")
+    if not (1 <= p <= rmax):
+        raise ValueError(f"p must be in [1, {rmax}]")
 
     s = np.linalg.svd(A, full_matrices=False, compute_uv=False)
 
     s_sum = float(np.sum(s))
-    lead = (s[:p] / s_sum) if s_sum > tol else np.zeros(p, dtype=float)
+    top = (s[:p] / s_sum) if s_sum > tol else np.zeros(p, dtype=float)
 
-    e = s * s
-    total = float(np.sum(e))
+    s2 = s * s
+    total = float(np.sum(s2))
     if total > tol:
-        c = np.cumsum(e) / total
-        r90 = float(np.searchsorted(c, 0.90) + 1)
-        r95 = float(np.searchsorted(c, 0.95) + 1)
+        c = np.cumsum(s2) / total
+        r_09 = float(np.searchsorted(c, 0.90) + 1)
+        r_095 = float(np.searchsorted(c, 0.95) + 1)
     else:
-        r90 = 0.0
-        r95 = 0.0
+        r_09 = 0.0
+        r_095 = 0.0
 
-    return np.concatenate([lead, np.array([r90, r95], dtype=float)])
+    return np.concatenate([top, np.array([r_09, r_095], dtype=float)])
 
 
 # =========================================================
-# Helper: fit standard LDA core (full covariance + ridge)
+# 4. Two-class LDA: training (corrected + stabilized)
 # =========================================================
-def _lda_fit_core(X, y01):
+def lda_train(X: np.ndarray, y: np.ndarray):
+    """
+    Returns (w, threshold). Predict 1 if X@w >= threshold else 0.
+    """
+    X = np.asarray(X, dtype=float)
+    y = np.asarray(y).reshape(-1)
+
+    if X.ndim != 2:
+        raise ValueError("X must be 2D")
+    if y.size != X.shape[0]:
+        raise ValueError("y must match number of rows in X")
+
+    classes = np.unique(y)
+    if classes.size != 2:
+        raise ValueError("lda_train expects exactly two classes")
+
+    # Map to {0,1} deterministically
+    y01 = (y == classes.max()).astype(int)
+
     X0 = X[y01 == 0]
     X1 = X[y01 == 1]
     if X0.shape[0] == 0 or X1.shape[0] == 0:
@@ -109,102 +139,32 @@ def _lda_fit_core(X, y01):
     d = Sw.shape[0]
     tr = float(np.trace(Sw))
     lam = 1e-6 * (tr / d if d > 0 else 1.0) + 1e-12
-    Sw = Sw + lam * np.eye(d)
+    Sw_reg = Sw + lam * np.eye(d)
 
-    w = np.linalg.solve(Sw, (mu1 - mu0))
+    w = np.linalg.solve(Sw_reg, (mu1 - mu0))
+
     m0 = float(mu0 @ w)
     m1 = float(mu1 @ w)
+    threshold = 0.5 * (m0 + m1)
 
+    # Ensure class-1 projects higher than class-0 for stable threshold rule
     if m1 < m0:
         w = -w
-        m0, m1 = -m0, -m1
-
-    return w, mu0, mu1, m0, m1
-
-
-# =========================================================
-# 4. LDA train with finer CV-tuned threshold bias
-# =========================================================
-def lda_train(X, y):
-    X = np.asarray(X, dtype=float)
-    y = np.asarray(y).reshape(-1)
-    if X.ndim != 2:
-        raise ValueError("X must be a 2D array")
-    if y.size != X.shape[0]:
-        raise ValueError("y must have length N")
-
-    classes = np.unique(y)
-    if classes.size != 2:
-        raise ValueError("lda_train expects exactly two classes")
-    y01 = (y == classes.max()).astype(int)
-
-    N = X.shape[0]
-    idx = np.arange(N)
-    K = 5 if N >= 80 else 3
-    folds = np.array_split(idx, K)
-
-    # Finer grid than before (small, safe, and still fast)
-    bias_factors = np.array([-0.05, -0.04, -0.03, -0.02, -0.01, 0.0,
-                             0.01, 0.02, 0.03, 0.04, 0.05], dtype=float)
-
-    best_bf = 0.0
-    best_acc = -1.0
-
-    for bf in bias_factors:
-        correct = 0
-        total = 0
-
-        for k in range(K):
-            va = folds[k]
-            tr = np.hstack([folds[j] for j in range(K) if j != k])
-
-            Xtr = X[tr]
-            ytr = y01[tr]
-            Xva = X[va]
-            yva = y01[va]
-
-            if np.all(ytr == 0) or np.all(ytr == 1):
-                continue
-
-            w, mu0, mu1, m0, m1 = _lda_fit_core(Xtr, ytr)
-            base_thr = 0.5 * (m0 + m1)
-            sep = max(m1 - m0, 1e-12)
-            thr = base_thr + bf * sep
-
-            pred = (Xva @ w >= thr).astype(int)
-            correct += int(np.sum(pred == yva))
-            total += yva.size
-
-        if total > 0:
-            acc = correct / total
-
-            # tie-break 1: higher CV accuracy
-            # tie-break 2: smaller |bf|
-            # tie-break 3: if still tied, prefer slightly negative bf
-            if (acc > best_acc + 1e-12 or
-                (abs(acc - best_acc) <= 1e-12 and abs(bf) < abs(best_bf)) or
-                (abs(acc - best_acc) <= 1e-12 and abs(bf) == abs(best_bf) and bf < best_bf)):
-                best_acc = acc
-                best_bf = bf
-
-    w, mu0, mu1, m0, m1 = _lda_fit_core(X, y01)
-    base_thr = 0.5 * (m0 + m1)
-    sep = max(m1 - m0, 1e-12)
-    threshold = base_thr + best_bf * sep
+        threshold = -threshold
 
     return w, float(threshold)
 
 
 # =========================================================
-# 5. LDA predict
+# 5. Two-class LDA: prediction
 # =========================================================
-def lda_predict(X, w, threshold):
+def lda_predict(X: np.ndarray, w: np.ndarray, threshold: float):
     X = np.asarray(X, dtype=float)
     w = np.asarray(w, dtype=float).reshape(-1)
     if X.ndim != 2:
-        raise ValueError("X must be a 2D array")
+        raise ValueError("X must be 2D")
     if X.shape[1] != w.size:
-        raise ValueError("Dimension mismatch between X and w")
+        raise ValueError("Dimension mismatch X and w")
     return (X @ w >= float(threshold)).astype(int)
 
 
@@ -215,7 +175,7 @@ def _example_run():
     try:
         data = np.load("project_data_example.npz")
     except OSError:
-        print("No example dataset found (project_data_example.npz).")
+        print("No example data file 'project_data_example.npz' found.")
         return
 
     X_train = data["X_train"]
@@ -224,13 +184,17 @@ def _example_run():
     y_test = data["y_test"]
 
     p = min(20, min(X_train.shape[1], X_train.shape[2]))
+
     Xf_train = np.vstack([svd_features(img, p) for img in X_train])
-    Xf_test  = np.vstack([svd_features(img, p) for img in X_test])
+    Xf_test = np.vstack([svd_features(img, p) for img in X_test])
 
     w, thr = lda_train(Xf_train, y_train)
     y_pred = lda_predict(Xf_test, w, thr)
 
-    acc = float(np.mean(y_pred == (y_test == np.max(np.unique(y_test))).astype(int)))
+    # Map y_test to {0,1} in the same way as training
+    classes = np.unique(y_train)
+    y_test01 = (y_test == classes.max()).astype(int)
+    acc = float(np.mean(y_pred == y_test01))
     print(f"Example test accuracy: {acc:.3f}")
 
 
