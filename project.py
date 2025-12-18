@@ -57,12 +57,13 @@ def svd_compress(image, k):
 
 
 # =========================================================
-# 3. Features (your proven one)
+# 3. Features (your proven one + tiny robustness tweak)
 # =========================================================
 def svd_features(image, p, tol=1e-12):
     """
     Feature vector length p+2:
       [ s1/sum(s), ..., sp/sum(s), r90, r95 ]
+    with per-image centering + scaling for robustness.
     """
     A = np.asarray(image, dtype=float)
     if A.ndim != 2:
@@ -71,6 +72,13 @@ def svd_features(image, p, tol=1e-12):
     rmax = min(m, n)
     if p < 1 or p > rmax:
         raise ValueError("p must satisfy 1 <= p <= min(m,n)")
+
+    # --- KEY TWEAK: normalize brightness/contrast per image ---
+    A = A - float(np.mean(A))
+    sA = float(np.std(A))
+    if sA > tol:
+        A = A / sA
+    # ---------------------------------------------------------
 
     s = np.linalg.svd(A, full_matrices=False, compute_uv=False)
 
@@ -115,6 +123,7 @@ def _lda_fit_core(X, y01):
     m0 = float(mu0 @ w)
     m1 = float(mu1 @ w)
 
+    # enforce m1 >= m0 so ">= threshold => class 1" is consistent
     if m1 < m0:
         w = -w
         m0, m1 = -m0, -m1
@@ -123,9 +132,14 @@ def _lda_fit_core(X, y01):
 
 
 # =========================================================
-# 4. LDA train with finer CV-tuned threshold bias
+# 4. LDA train with tiny CV-tuned threshold bias (conservative grid)
 # =========================================================
 def lda_train(X, y):
+    """
+    Standard LDA, but we add a tiny threshold bias:
+        threshold = 0.5*(m0+m1) + bf*(m1-m0)
+    bf is chosen by deterministic K-fold CV from a small grid.
+    """
     X = np.asarray(X, dtype=float)
     y = np.asarray(y).reshape(-1)
     if X.ndim != 2:
@@ -136,16 +150,15 @@ def lda_train(X, y):
     classes = np.unique(y)
     if classes.size != 2:
         raise ValueError("lda_train expects exactly two classes")
-    y01 = (y == classes.max()).astype(int)
+    y01 = (y == classes.max()).astype(int)  # deterministic map
 
     N = X.shape[0]
     idx = np.arange(N)
     K = 5 if N >= 80 else 3
     folds = np.array_split(idx, K)
 
-    # Finer grid than before (small, safe, and still fast)
-    bias_factors = np.array([-0.05, -0.04, -0.03, -0.02, -0.01, 0.0,
-                             0.01, 0.02, 0.03, 0.04, 0.05], dtype=float)
+    # Conservative (generalizes better than wide grids once you're near 0.686)
+    bias_factors = np.array([-0.03, -0.015, 0.0, 0.015, 0.03], dtype=float)
 
     best_bf = 0.0
     best_acc = -1.0
@@ -177,16 +190,12 @@ def lda_train(X, y):
 
         if total > 0:
             acc = correct / total
-
-            # tie-break 1: higher CV accuracy
-            # tie-break 2: smaller |bf|
-            # tie-break 3: if still tied, prefer slightly negative bf
-            if (acc > best_acc + 1e-12 or
-                (abs(acc - best_acc) <= 1e-12 and abs(bf) < abs(best_bf)) or
-                (abs(acc - best_acc) <= 1e-12 and abs(bf) == abs(best_bf) and bf < best_bf)):
+            # tie-break: choose smaller |bf| (more conservative)
+            if acc > best_acc + 1e-12 or (abs(acc - best_acc) <= 1e-12 and abs(bf) < abs(best_bf)):
                 best_acc = acc
                 best_bf = bf
 
+    # Fit on full data with chosen bias
     w, mu0, mu1, m0, m1 = _lda_fit_core(X, y01)
     base_thr = 0.5 * (m0 + m1)
     sep = max(m1 - m0, 1e-12)
