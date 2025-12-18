@@ -48,8 +48,7 @@ def svd_compress(image, k):
         raise ValueError("k must be >= 1")
 
     U, s, Vt = np.linalg.svd(A, full_matrices=False)
-    r = s.size
-    k_eff = int(min(k, r))
+    k_eff = int(min(k, s.size))
     Ak = (U[:, :k_eff] * s[:k_eff]) @ Vt[:k_eff, :]
 
     denom = np.linalg.norm(A, ord="fro")
@@ -58,7 +57,7 @@ def svd_compress(image, k):
 
 
 # =========================================================
-# 3. SVD features (your friend's stable version)
+# 3. Features (keep the proven one that already got ~68.1%)
 # =========================================================
 def svd_features(image, p, tol=1e-12):
     """
@@ -92,15 +91,11 @@ def svd_features(image, p, tol=1e-12):
 
 
 # =========================================================
-# Helper: fit LDA weights with ridge, return (w, m0, m1, mu0, mu1)
+# Helper: fit standard LDA core (full covariance + ridge)
 # =========================================================
-def _lda_fit_core(X, y):
-    """
-    Assumes y in {0,1}.
-    Returns w, mu0, mu1, m0, m1.
-    """
-    X0 = X[y == 0]
-    X1 = X[y == 1]
+def _lda_fit_core(X, y01):
+    X0 = X[y01 == 0]
+    X1 = X[y01 == 1]
     if X0.shape[0] == 0 or X1.shape[0] == 0:
         raise ValueError("Both classes must have at least one sample")
 
@@ -117,82 +112,71 @@ def _lda_fit_core(X, y):
     Sw = Sw + lam * np.eye(d)
 
     w = np.linalg.solve(Sw, (mu1 - mu0))
-
     m0 = float(mu0 @ w)
     m1 = float(mu1 @ w)
 
-    # enforce m1 >= m0 for consistent ">= threshold => class 1"
+    # enforce m1 >= m0 so ">= threshold => class 1" is consistent
     if m1 < m0:
         w = -w
         m0, m1 = -m0, -m1
-        mu0, mu1 = mu0, mu1  # unchanged; projections already fixed
 
     return w, mu0, mu1, m0, m1
 
 
 # =========================================================
-# 4. LDA training (SAFE prior correction chosen by CV)
+# 4. LDA train with tiny CV-tuned threshold bias (the key tweak)
 # =========================================================
 def lda_train(X, y):
     """
-    Train LDA and choose a safe prior-correction strength beta via deterministic CV.
-
-    threshold(beta) = 0.5*(m0+m1) - beta * log(pi1/pi0)
-
-    beta is chosen from a small grid; if correction hurts, beta=0 wins automatically.
+    Standard LDA, but we add a tiny threshold bias:
+        threshold = 0.5*(m0+m1) + bias
+    bias is chosen by deterministic K-fold CV from a small grid.
+    This is a “one-image flip” knob, and it won’t collapse because CV can pick 0.
     """
     X = np.asarray(X, dtype=float)
     y = np.asarray(y).reshape(-1)
-
     if X.ndim != 2:
         raise ValueError("X must be a 2D array")
     if y.size != X.shape[0]:
         raise ValueError("y must have length N")
 
-    # IMPORTANT: keep labels as 0/1 to match autograder.
-    # If y is not 0/1, map it but return a classifier that still outputs 0/1.
     classes = np.unique(y)
     if classes.size != 2:
         raise ValueError("lda_train expects exactly two classes")
-
-    # Map to {0,1} deterministically (smaller value -> 0, larger -> 1)
-    y01 = (y == classes.max()).astype(int)
+    y01 = (y == classes.max()).astype(int)  # deterministic map
 
     N = X.shape[0]
     idx = np.arange(N)
     K = 5 if N >= 80 else 3
     folds = np.array_split(idx, K)
 
-    betas = np.array([0.0, 0.25, 0.5, 0.75, 1.0], dtype=float)
+    # Bias grid is scaled by the class-mean separation in 1D.
+    # Values are tiny by design.
+    bias_factors = np.array([-0.04, -0.02, 0.0, 0.02, 0.04], dtype=float)
 
-    best_beta = 0.0
+    best_bf = 0.0
     best_acc = -1.0
 
-    for beta in betas:
+    for bf in bias_factors:
         correct = 0
         total = 0
+
         for k in range(K):
-            val_idx = folds[k]
-            tr_idx = np.hstack([folds[j] for j in range(K) if j != k])
+            va = folds[k]
+            tr = np.hstack([folds[j] for j in range(K) if j != k])
 
-            Xtr = X[tr_idx]
-            ytr = y01[tr_idx]
-            Xva = X[val_idx]
-            yva = y01[val_idx]
+            Xtr = X[tr]
+            ytr = y01[tr]
+            Xva = X[va]
+            yva = y01[va]
 
-            # Must contain both classes
             if np.all(ytr == 0) or np.all(ytr == 1):
                 continue
 
             w, mu0, mu1, m0, m1 = _lda_fit_core(Xtr, ytr)
-
-            # midpoint
-            thr = 0.5 * (m0 + m1)
-
-            # prior correction (bounded by beta; beta=0 is baseline)
-            pi0 = max(np.mean(ytr == 0), 1e-12)
-            pi1 = max(np.mean(ytr == 1), 1e-12)
-            thr = thr - beta * np.log(pi1 / pi0)
+            base_thr = 0.5 * (m0 + m1)
+            sep = max(m1 - m0, 1e-12)
+            thr = base_thr + bf * sep
 
             pred = (Xva @ w >= thr).astype(int)
             correct += int(np.sum(pred == yva))
@@ -200,24 +184,22 @@ def lda_train(X, y):
 
         if total > 0:
             acc = correct / total
-            # tie-break: prefer smaller beta (more conservative)
-            if acc > best_acc + 1e-12 or (abs(acc - best_acc) <= 1e-12 and beta < best_beta):
+            # tie-break: choose smaller |bias| (more conservative)
+            if acc > best_acc + 1e-12 or (abs(acc - best_acc) <= 1e-12 and abs(bf) < abs(best_bf)):
                 best_acc = acc
-                best_beta = beta
+                best_bf = bf
 
-    # Fit on full data using best_beta
+    # Fit on full data with chosen bias
     w, mu0, mu1, m0, m1 = _lda_fit_core(X, y01)
-    thr = 0.5 * (m0 + m1)
+    base_thr = 0.5 * (m0 + m1)
+    sep = max(m1 - m0, 1e-12)
+    threshold = base_thr + best_bf * sep
 
-    pi0 = max(np.mean(y01 == 0), 1e-12)
-    pi1 = max(np.mean(y01 == 1), 1e-12)
-    thr = thr - best_beta * np.log(pi1 / pi0)
-
-    return w, float(thr)
+    return w, float(threshold)
 
 
 # =========================================================
-# 5. LDA prediction
+# 5. LDA predict
 # =========================================================
 def lda_predict(X, w, threshold):
     X = np.asarray(X, dtype=float)
@@ -250,7 +232,10 @@ def _example_run():
 
     w, thr = lda_train(Xf_train, y_train)
     y_pred = lda_predict(Xf_test, w, thr)
-    print("Example accuracy:", float(np.mean(y_pred == (y_test == np.max(np.unique(y_test))).astype(int))))
+
+    # if y_test is 0/1 this is correct; otherwise map similarly
+    acc = float(np.mean(y_pred == (y_test == np.max(np.unique(y_test))).astype(int)))
+    print(f"Example test accuracy: {acc:.3f}")
 
 
 if __name__ == "__main__":
