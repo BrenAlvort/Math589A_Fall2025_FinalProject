@@ -4,28 +4,6 @@ import numpy as np
 # 1. Power method for dominant eigenpair (symmetric matrix)
 # =========================================================
 def power_method(A, x0, maxit, tol):
-    """
-    Approximate the dominant eigenvalue/eigenvector of a real symmetric matrix A
-    using the power method.
-
-    Parameters
-    ----------
-    A : (n, n) ndarray
-        Real symmetric matrix.
-    x0 : (n,) ndarray
-        Initial guess (must be nonzero).
-    maxit : int
-        Maximum number of iterations.
-    tol : float
-        Convergence tolerance on successive eigenvalue estimates.
-
-    Returns
-    -------
-    lam : float
-        Approximate dominant eigenvalue.
-    x : (n,) ndarray
-        Approximate dominant eigenvector (unit 2-norm).
-    """
     A = np.asarray(A, dtype=np.float64)
     if A.ndim != 2 or A.shape[0] != A.shape[1]:
         raise ValueError("A must be a square matrix")
@@ -34,11 +12,12 @@ def power_method(A, x0, maxit, tol):
     x = np.asarray(x0, dtype=np.float64).reshape(-1)
     if x.size != n:
         raise ValueError("x0 must have shape (n,)")
+
     nx = np.linalg.norm(x)
     if nx == 0:
         x = np.ones(n, dtype=np.float64)
         nx = np.linalg.norm(x)
-    x = x / nx
+    x /= nx
 
     lam_old = None
     lam = float(x @ (A @ x))
@@ -63,23 +42,6 @@ def power_method(A, x0, maxit, tol):
 # 2. Rank-k image approximation using SVD
 # =========================================================
 def svd_compress(image, k):
-    """
-    Compute a rank-k approximation of a grayscale image using SVD.
-
-    Parameters
-    ----------
-    image : (m, n) ndarray
-        Image matrix.
-    k : int
-        Target rank (k >= 1).
-
-    Returns
-    -------
-    image_k : (m, n) ndarray
-        Rank-k approximation.
-    rel_error : float
-        Relative Frobenius error ||A - A_k||_F / ||A||_F.
-    """
     A = np.asarray(image, dtype=np.float64)
     if A.ndim != 2:
         raise ValueError("image must be a 2D array")
@@ -99,16 +61,17 @@ def svd_compress(image, k):
 
 
 # =========================================================
-# 3. Build feature vector from image singular values
-#    (Leaderboard-stable version)
+# 3. Feature vector from image singular values (aggressive but stable)
 # =========================================================
 def svd_features(image, p, tol=1e-12):
     """
     Feature vector (length p+2):
-        [ sigma_1/||A||_F, ..., sigma_p/||A||_F, r90, r95 ]
 
-    where r_alpha is the smallest r such that:
-        sum_{i=1}^r sigma_i^2 >= alpha * sum_i sigma_i^2
+      lead[i] = cumulative_energy[i] = (sum_{j<=i} sigma_j^2) / (sum_j sigma_j^2)
+      extra 1 = spectral_entropy of normalized energy distribution
+      extra 2 = effective_rank = exp(entropy)
+
+    All are scale-invariant and smoother than discrete rank cutoffs.
     """
     A = np.asarray(image, dtype=np.float64)
     if A.ndim != 2:
@@ -119,50 +82,39 @@ def svd_features(image, p, tol=1e-12):
     if p < 1 or p > rmax:
         raise ValueError("p must satisfy 1 <= p <= min(m,n)")
 
-    # singular values only; reduced factorization
     S = np.linalg.svd(A, full_matrices=False, compute_uv=False)
+    e = S * S
+    tot = float(e.sum())
 
-    energy = S * S
-    total_energy = float(energy.sum())
-    if total_energy <= tol:
-        # Degenerate image
+    if tot <= tol:
         return np.zeros(p + 2, dtype=np.float32)
 
-    # Effective ranks
-    c = np.cumsum(energy) / total_energy
-    r90 = float(np.searchsorted(c, 0.90) + 1)
-    r95 = float(np.searchsorted(c, 0.95) + 1)
+    # Cumulative energy profile (very robust)
+    cum = np.cumsum(e) / tot
+    lead = cum[:p].astype(np.float32, copy=False)
 
-    # Frobenius normalization (stable under global intensity scaling)
-    frob = np.sqrt(total_energy)
-    lead = (S[:p] / frob).astype(np.float32, copy=False)
+    # Spectral entropy + effective rank (continuous, informative)
+    # p_i are energy proportions; entropy H = -sum p_i log p_i
+    pi = e / tot
+    eps = 1e-12
+    H = -float(np.sum(pi * np.log(pi + eps)))
+    eff_rank = float(np.exp(H))
 
-    return np.concatenate([lead, np.array([r90, r95], dtype=np.float32)])
+    return np.concatenate([lead, np.array([H, eff_rank], dtype=np.float32)])
 
 
 # =========================================================
-# 4. Two-class LDA: training
+# 4. Two-class LDA: training (mild shrinkage)
 # =========================================================
 def lda_train(X, y):
     """
-    Train a two-class Linear Discriminant Analysis classifier.
-
-    Parameters
-    ----------
-    X : (N, d) ndarray
-        Feature matrix.
-    y : (N,) ndarray
-        Binary labels (0/1).
-
-    Returns
-    -------
-    w : (d,) ndarray
-        Discriminant direction.
-    threshold : float
-        Predict 1 if (X @ w) >= threshold else 0.
+    LDA with mild covariance shrinkage:
+      Sw_shrunk = (1-gamma) Sw + gamma * (tr(Sw)/d) I
+    This often improves generalization slightly without destabilizing.
     """
     X = np.asarray(X, dtype=np.float64)
     y = np.asarray(y).reshape(-1)
+
     if X.ndim != 2:
         raise ValueError("X must be a 2D array")
     if y.size != X.shape[0]:
@@ -176,26 +128,28 @@ def lda_train(X, y):
     mu0 = X0.mean(axis=0)
     mu1 = X1.mean(axis=0)
 
-    # Within-class scatter
     X0c = X0 - mu0
     X1c = X1 - mu1
     Sw = (X0c.T @ X0c) + (X1c.T @ X1c)
 
-    # Light Tikhonov regularization (robust but not aggressive)
     d = Sw.shape[0]
     tr = float(np.trace(Sw))
-    lam = (1e-6 * tr / d) if tr > 0.0 else 1e-6
-    Sw = Sw + lam * np.eye(d, dtype=np.float64)
+    if tr <= 0.0:
+        tr = 1.0
 
-    # Solve Sw w = (mu1 - mu0)
+    # mild shrinkage (small gamma to avoid “distribution cliff”)
+    gamma = 0.06
+    Sw = (1.0 - gamma) * Sw + gamma * (tr / d) * np.eye(d, dtype=np.float64)
+
+    # tiny diagonal loading
+    Sw = Sw + (1e-8 * tr / d) * np.eye(d, dtype=np.float64)
+
     w = np.linalg.solve(Sw, (mu1 - mu0))
 
-    # Midpoint threshold in projected space
     m0 = float(mu0 @ w)
     m1 = float(mu1 @ w)
     threshold = 0.5 * (m0 + m1)
 
-    # Ensure class-1 scores higher
     if m1 < m0:
         w = -w
         threshold = -threshold
@@ -207,42 +161,15 @@ def lda_train(X, y):
 # 5. Two-class LDA: prediction
 # =========================================================
 def lda_predict(X, w, threshold):
-    """
-    Predict labels for samples using the trained LDA model.
-
-    Parameters
-    ----------
-    X : (N, d) ndarray
-        Feature matrix.
-    w : (d,) ndarray
-        Discriminant direction from lda_train.
-    threshold : float
-        Threshold from lda_train.
-
-    Returns
-    -------
-    y_pred : (N,) ndarray of int
-        Predicted labels in {0,1}.
-    """
     X = np.asarray(X, dtype=np.float64)
     w = np.asarray(w, dtype=np.float64).reshape(-1)
-    if X.ndim != 2:
-        raise ValueError("X must be a 2D array")
-    if X.shape[1] != w.size:
-        raise ValueError("Dimension mismatch between X and w")
-
-    z = X @ w
-    return (z >= float(threshold)).astype(int)
+    return (X @ w >= float(threshold)).astype(int)
 
 
 # =========================================================
 # Local smoke test (not used by autograder)
 # =========================================================
 def _example_run():
-    """
-    Run a tiny end-to-end test if 'project_data_example.npz' exists.
-    This is for local testing only and will NOT be called by the autograder.
-    """
     try:
         data = np.load("project_data_example.npz")
     except OSError:
@@ -260,9 +187,7 @@ def _example_run():
 
     w, thr = lda_train(Xf_train, y_train)
     y_pred = lda_predict(Xf_test, w, thr)
-
-    acc = np.mean(y_pred == y_test)
-    print(f"Example test accuracy: {acc:.3f}")
+    print("Example accuracy:", float(np.mean(y_pred == y_test)))
 
 
 if __name__ == "__main__":
